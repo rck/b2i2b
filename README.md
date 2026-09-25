@@ -78,6 +78,24 @@ including the refusal and warning paths. It needs root, `losetup`,
 sudo make test
 ```
 
+## Nix / home-manager
+
+The repo is a flake. In your home-manager flake:
+
+```nix
+inputs.b2i2b = {
+  url = "github:rck/b2i2b";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+```nix
+home.packages = [ inputs.b2i2b.packages.${pkgs.system}.default ];
+```
+
+The package wraps the script so pv and all compressors are on its PATH,
+independent of what else is installed.
+
 ## License
 
 GPL-3.0-or-later, see `LICENSE`.
