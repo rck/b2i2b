@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Roland Kammerer <roland.kammerer@linbit.com>
+#
+# b2i2b - copy a block device to a (compressed) image and back.
+#
+#   b2i /dev/sdX image.zst   block device -> image
+#   i2b image.zst /dev/sdX   image -> block device
+#
+# Install as one script plus two symlinks (b2i, i2b), or call it as
+# "b2i2b b2i ..." / "b2i2b i2b ...".
+#
+# The compression algorithm is picked from the image's file extension.
+# Progress is shown with pv(1) when available, else dd's status=progress.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+BS="${B2I2B_BS:-4M}"
+
+prog=$(basename "$0")
+mode=""
+force=0
+
+usage() {
+    cat <<USAGE
+Usage:
+  b2i [-f] <block-device> <image>    copy block device to (compressed) image
+  i2b [-f] <image> <block-device>    copy (compressed) image to block device
+  b2i2b {b2i|i2b} [-f] <src> <dst>   same, without symlinks
+
+Options:
+  -f, --force     b2i: overwrite an existing image file
+                  i2b: write even if the device is mounted or in use
+  -h, --help      show this help
+  -V, --version   show version
+
+Compression is chosen by the image's extension:
+  .gz .gzip   gzip   (pigz if installed)
+  .bz2        bzip2  (pbzip2/lbzip2 if installed)
+  .xz         xz
+  .zst .zstd  zstd
+  .lz4        lz4
+  .lzo        lzop
+  .lz         lzip
+  anything else is treated as a raw, uncompressed image (e.g. .img, .raw)
+
+Environment:
+  B2I2B_BS    block size passed to dd (default: 4M)
+  ZSTD_CLEVEL, XZ_OPT, GZIP, ...  are honoured by the respective compressors
+USAGE
+}
+
+die() { printf '%s: error: %s\n' "$prog" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$prog" "$*" >&2; }
+info() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# compression selection
+# ---------------------------------------------------------------------------
+
+# Sets COMP_NAME, COMP_CMD (array) and DECOMP_CMD (array) based on extension.
+select_compression() {
+    local file=$1 ext
+    ext=${file##*.}
+    [[ "$file" == *.* ]] || ext=""
+    ext=${ext,,}
+
+    case "$ext" in
+        gz|gzip)
+            if have pigz; then
+                COMP_NAME="gzip (pigz)"; COMP_CMD=(pigz -c); DECOMP_CMD=(pigz -dc)
+            else
+                COMP_NAME="gzip"; COMP_CMD=(gzip -c); DECOMP_CMD=(gzip -dc)
+            fi ;;
+        bz2)
+            if have pbzip2; then
+                COMP_NAME="bzip2 (pbzip2)"; COMP_CMD=(pbzip2 -c); DECOMP_CMD=(pbzip2 -dc)
+            elif have lbzip2; then
+                COMP_NAME="bzip2 (lbzip2)"; COMP_CMD=(lbzip2 -c); DECOMP_CMD=(lbzip2 -dc)
+            else
+                COMP_NAME="bzip2"; COMP_CMD=(bzip2 -c); DECOMP_CMD=(bzip2 -dc)
+            fi ;;
+        xz)
+            COMP_NAME="xz"; COMP_CMD=(xz -T0 -c); DECOMP_CMD=(xz -T0 -dc) ;;
+        zst|zstd)
+            COMP_NAME="zstd"; COMP_CMD=(zstd -T0 -c); DECOMP_CMD=(zstd -T0 -dc) ;;
+        lz4)
+            COMP_NAME="lz4"; COMP_CMD=(lz4 -c); DECOMP_CMD=(lz4 -dc) ;;
+        lzo)
+            COMP_NAME="lzop"; COMP_CMD=(lzop -c); DECOMP_CMD=(lzop -dc) ;;
+        lz)
+            COMP_NAME="lzip"; COMP_CMD=(lzip -c); DECOMP_CMD=(lzip -dc) ;;
+        *)
+            COMP_NAME="none"; COMP_CMD=(cat); DECOMP_CMD=(cat) ;;
+    esac
+
+    have "${COMP_CMD[0]}" || die "'${COMP_CMD[0]}' is required for $COMP_NAME but not installed"
+}
+
+# ---------------------------------------------------------------------------
+# block device helpers
+# ---------------------------------------------------------------------------
+
+device_size() {
+    local dev=$1
+    if have blockdev; then
+        blockdev --getsize64 "$dev" 2>/dev/null && return
+    fi
+    if have lsblk; then
+        lsblk -bdno SIZE "$dev" 2>/dev/null | tr -d ' ' && return
+    fi
+    # /sys fallback: size is in 512-byte sectors
+    local name sz
+    name=$(basename "$(readlink -f "$dev")")
+    if [[ -r /sys/class/block/$name/size ]]; then
+        read -r sz < "/sys/class/block/$name/size"
+        echo $((sz * 512))
+        return
+    fi
+    return 1
+}
+
+# Prints reasons the device (or any of its partitions) is in use; empty if idle.
+device_in_use() {
+    local dev=$1 name sysdir n p
+    name=$(basename "$(readlink -f "$dev")")
+    sysdir=/sys/class/block/$name
+    [[ -d $sysdir ]] || return 0
+
+    # device itself plus its partitions
+    local -a nodes=("/dev/$name")
+    for p in "$sysdir"/"$name"*/; do
+        [[ -d $p ]] && nodes+=("/dev/$(basename "$p")")
+    done
+
+    for n in "${nodes[@]}"; do
+        local real
+        real=$(readlink -f "$n")
+        awk -v d="$real" '$1 == d { print "mounted on " $2 }' /proc/self/mounts 2>/dev/null
+        awk -v d="$real" 'NR > 1 && $1 == d { print "active swap" }' /proc/swaps 2>/dev/null
+        local hdir=/sys/class/block/$(basename "$n")/holders
+        if [[ -d $hdir ]] && [[ -n "$(ls -A "$hdir" 2>/dev/null)" ]]; then
+            echo "held by $(ls "$hdir" | tr '\n' ' ')(LVM/md/dm-crypt?)"
+        fi
+    done
+}
+
+check_block_device() {
+    local dev=$1
+    [[ -e $dev ]] || die "'$dev' does not exist"
+    [[ -b $dev ]] || die "'$dev' is not a block device"
+}
+
+# ---------------------------------------------------------------------------
+# progress
+# ---------------------------------------------------------------------------
+
+have_pv=0
+if have pv; then have_pv=1; fi
+
+# ---------------------------------------------------------------------------
+# b2i: block device -> image
+# ---------------------------------------------------------------------------
+
+b2i() {
+    local dev=$1 img=$2 size
+
+    check_block_device "$dev"
+    [[ -r $dev ]] || die "'$dev' is not readable (try running as root)"
+
+    if [[ -e $img ]]; then
+        [[ -b $img ]] && die "'$img' is a block device; b2i expects an image file as second argument (did you mean i2b?)"
+        (( force )) || die "'$img' already exists (use -f to overwrite)"
+        [[ -f $img ]] || die "'$img' exists and is not a regular file"
+    fi
+    local dir
+    dir=$(dirname "$img")
+    [[ -d $dir ]] || die "directory '$dir' does not exist"
+    [[ -w $dir ]] || die "directory '$dir' is not writable"
+
+    select_compression "$img"
+
+    local in_use
+    in_use=$(device_in_use "$dev")
+    if [[ -n $in_use ]]; then
+        warn "'$dev' is in use, the image may be inconsistent:"
+        sed 's/^/  /' <<<"$in_use" >&2
+    fi
+
+    size=$(device_size "$dev" || true)
+    info "reading $dev${size:+ ($(numfmt --to=iec-i --suffix=B "$size" 2>/dev/null || echo "$size bytes"))}"
+    info "writing $img (compression: $COMP_NAME)"
+
+    # remove partial image on failure
+    trap 'rc=$?; rm -f -- "$img"; exit $rc' ERR INT TERM
+
+    if (( have_pv )); then
+        dd if="$dev" bs="$BS" status=none \
+            | pv -ptearb ${size:+-s "$size"} \
+            | "${COMP_CMD[@]}" > "$img"
+    else
+        warn "pv not installed, falling back to dd's own progress output"
+        dd if="$dev" bs="$BS" status=progress \
+            | "${COMP_CMD[@]}" > "$img"
+    fi
+    sync -- "$img"
+    trap - ERR INT TERM
+
+    info "done: $(du -h -- "$img" | cut -f1) written to $img"
+}
+
+# ---------------------------------------------------------------------------
+# i2b: image -> block device
+# ---------------------------------------------------------------------------
+
+i2b() {
+    local img=$1 dev=$2
+
+    [[ -e $img ]] || die "'$img' does not exist"
+    [[ -b $img ]] && die "'$img' is a block device; i2b expects an image file as first argument (did you mean b2i?)"
+    [[ -f $img ]] || die "'$img' is not a regular file"
+    [[ -r $img ]] || die "'$img' is not readable"
+
+    check_block_device "$dev"
+    [[ -w $dev ]] || die "'$dev' is not writable (try running as root)"
+
+    select_compression "$img"
+    have "${DECOMP_CMD[0]}" || die "'${DECOMP_CMD[0]}' is required to decompress $COMP_NAME but not installed"
+
+    local in_use
+    in_use=$(device_in_use "$dev")
+    if [[ -n $in_use ]]; then
+        if (( force )); then
+            warn "'$dev' is in use, continuing because of -f:"
+        else
+            printf '%s: error: %s\n' "$prog" "'$dev' is in use (use -f to write anyway):" >&2
+        fi
+        sed 's/^/  /' <<<"$in_use" >&2
+        (( force )) || exit 1
+    fi
+
+    local size
+    size=$(device_size "$dev" || true)
+    if [[ $COMP_NAME == none && -n $size ]]; then
+        local img_size
+        img_size=$(stat -c %s -- "$img")
+        (( img_size <= size )) || die "raw image is larger than the device ($img_size > $size bytes)"
+    fi
+    info "reading $img (compression: $COMP_NAME)"
+    info "writing $dev${size:+ ($(numfmt --to=iec-i --suffix=B "$size" 2>/dev/null || echo "$size bytes"))}"
+
+    if (( have_pv )); then
+        pv -ptearb -- "$img" \
+            | "${DECOMP_CMD[@]}" \
+            | dd of="$dev" bs="$BS" iflag=fullblock conv=fsync status=none
+    else
+        warn "pv not installed, falling back to dd's own progress output"
+        "${DECOMP_CMD[@]}" < "$img" \
+            | dd of="$dev" bs="$BS" iflag=fullblock conv=fsync status=progress
+    fi
+
+    info "done: $img written to $dev"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+case "$prog" in
+    b2i|i2b) mode=$prog ;;
+esac
+
+args=()
+while (( $# )); do
+    case "$1" in
+        -f|--force) force=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -V|--version) echo "$prog $VERSION"; exit 0 ;;
+        --) shift; args+=("$@"); break ;;
+        -*) die "unknown option '$1'" ;;
+        *)
+            if [[ -z $mode && ${#args[@]} -eq 0 ]] && [[ $1 == b2i || $1 == i2b ]]; then
+                mode=$1
+            else
+                args+=("$1")
+            fi ;;
+    esac
+    shift
+done
+
+[[ -n $mode ]] || { usage >&2; die "invoke as b2i or i2b, or pass b2i/i2b as first argument"; }
+(( ${#args[@]} == 2 )) || { usage >&2; die "$mode needs exactly two arguments"; }
+
+"$mode" "${args[0]}" "${args[1]}"
