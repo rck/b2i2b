@@ -93,7 +93,7 @@ inputs.b2i2b = {
 home.packages = [ inputs.b2i2b.packages.${pkgs.system}.default ];
 ```
 
-The package wraps the script so pv and all compressors are on its PATH,
+The package patches PATH into the script so pv and all compressors are found,
 independent of what else is installed.
 
 ## License

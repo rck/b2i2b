@@ -1,6 +1,6 @@
 { lib
 , stdenvNoCC
-, makeWrapper
+, bash
 , coreutils
 , util-linux
 , pv
@@ -20,9 +20,21 @@ stdenvNoCC.mkDerivation {
 
   src = ./.;
 
-  nativeBuildInputs = [ makeWrapper ];
+  buildInputs = [ bash ];
 
   dontBuild = true;
+
+  # The script dispatches on $(basename "$0"), so b2i/i2b must stay plain
+  # symlinks to the real script. wrapProgram would rename it to
+  # .b2i2b-wrapped (exec -a does not change $0 of a #! script), which
+  # breaks that dispatch. Patch PATH into the script instead.
+  postPatch = ''
+    substituteInPlace b2i2b --replace-fail 'set -euo pipefail' \
+      'set -euo pipefail
+export PATH="${lib.makeBinPath [
+  coreutils util-linux pv gzip pigz bzip2 xz zstd lz4 lzop lzip
+]}:$PATH"'
+  '';
 
   installPhase = ''
     runHook preInstall
@@ -30,14 +42,6 @@ stdenvNoCC.mkDerivation {
     ln -s b2i2b $out/bin/b2i
     ln -s b2i2b $out/bin/i2b
     runHook postInstall
-  '';
-
-  # makeWrapper's wrapper does `exec -a "$0"`, so the script still sees
-  # b2i / i2b as its name when called through the symlinks.
-  postFixup = ''
-    wrapProgram $out/bin/b2i2b --prefix PATH : ${lib.makeBinPath [
-      coreutils util-linux pv gzip pigz bzip2 xz zstd lz4 lzop lzip
-    ]}
   '';
 
   meta = with lib; {
