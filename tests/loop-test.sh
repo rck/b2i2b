@@ -18,7 +18,7 @@ I2B="$here/../i2b"
 # ---------------------------------------------------------------------------
 
 (( EUID == 0 )) || { echo "must run as root" >&2; exit 1; }
-for t in losetup mkfs.ext4 cmp zstd; do
+for t in losetup blockdev mkfs.ext4 cmp zstd; do
     command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }
 done
 command -v pv >/dev/null || echo "note: pv not installed, progress falls back to dd" >&2
@@ -45,6 +45,14 @@ mkloop() {  # mkloop <size> -> prints loop device
     dev=$(losetup --find --show "$f")
     loops+=("$dev")
     echo "$dev"
+}
+
+# zero_dev <dev>: wipe a block device. dd without count would run into
+# ENOSPC and exit non-zero, which set -e turns into a test abort.
+zero_dev() {
+    local bytes
+    bytes=$(blockdev --getsize64 "$1")
+    dd if=/dev/zero of="$1" bs=1M count=$(( bytes / 1048576 )) status=none
 }
 
 # ---------------------------------------------------------------------------
@@ -123,11 +131,11 @@ expect_fail "i2b refuses mounted target" "is in use" \
     "$I2B" "$work/test.zst" "$dst"
 umount "$mnt_dst"
 
-dd if=/dev/zero of="$dst" bs=4M status=none
+zero_dev "$dst"
 expect_ok "i2b raw" "$I2B" "$work/test.img" "$dst"
 if cmp -s "$src" "$dst"; then ok "raw round trip identical"; else nok "raw round trip differs"; fi
 if [[ -e $work/test.xz ]]; then
-    dd if=/dev/zero of="$dst" bs=4M status=none
+    zero_dev "$dst"
     expect_ok "i2b xz" "$I2B" "$work/test.xz" "$dst"
     if cmp -s "$src" "$dst"; then ok "xz round trip identical"; else nok "xz round trip differs"; fi
 fi
