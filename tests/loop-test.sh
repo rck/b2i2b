@@ -28,11 +28,20 @@ mnt_src=$work/mnt-src
 mnt_dst=$work/mnt-dst
 mkdir -p "$mnt_src" "$mnt_dst"
 
-loops=()
+# Detach every loop device backed by a file under $work. We ask the kernel
+# instead of tracking devices in a shell array: mkloop runs in a command
+# substitution, so an array append there would be lost in the subshell, and
+# a scan also catches a device attached right before the script died.
 cleanup() {
     set +e
     umount "$mnt_src" "$mnt_dst" 2>/dev/null
-    (( ${#loops[@]} )) && losetup -d "${loops[@]}" 2>/dev/null
+    local d
+    for d in /sys/block/loop*; do
+        [[ -e $d/loop/backing_file ]] || continue
+        case $(<"$d/loop/backing_file") in
+            "$work"/*) losetup -d "/dev/${d##*/}" 2>/dev/null ;;
+        esac
+    done
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -41,10 +50,7 @@ mkloop() {  # mkloop <size> -> prints loop device
     local f
     f=$(mktemp "$work/backing.XXXXXX")
     truncate -s "$1" "$f"
-    local dev
-    dev=$(losetup --find --show "$f")
-    loops+=("$dev")
-    echo "$dev"
+    losetup --find --show "$f"
 }
 
 # zero_dev <dev>: wipe a block device. dd without count would run into
